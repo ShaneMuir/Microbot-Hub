@@ -28,8 +28,11 @@ import java.awt.*;
 public class BaropasGeFiremakerPlugin extends Plugin {
     static final String version = "1.0.0";
 
+    // Package-private (not private): the overlay reads stats through this exact instance via
+    // plugin.script, since injecting BaropasGeFiremakerScript separately into the overlay is not
+    // guaranteed to resolve to the same object without an explicit singleton binding.
     @Inject
-    private BaropasGeFiremakerScript script;
+    BaropasGeFiremakerScript script;
 
     @Inject
     private BaropasGeFiremakerOverlay overlay;

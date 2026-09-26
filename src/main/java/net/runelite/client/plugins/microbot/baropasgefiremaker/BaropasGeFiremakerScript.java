@@ -8,10 +8,14 @@ import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.events.ChatMessage;
 import net.runelite.api.gameval.ItemID;
 import net.runelite.api.gameval.ObjectID;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginInstantiationException;
+import net.runelite.client.plugins.PluginManager;
 import net.runelite.client.plugins.microbot.Microbot;
 import net.runelite.client.plugins.microbot.statemachine.StateMachineScript;
 import net.runelite.client.plugins.microbot.statemachine.Transition;
 import net.runelite.client.plugins.microbot.util.antiban.Rs2Antiban;
+import net.runelite.client.plugins.microbot.util.antiban.Rs2AntibanSettings;
 import net.runelite.client.plugins.microbot.util.antiban.enums.Activity;
 import net.runelite.client.plugins.microbot.util.bank.Rs2Bank;
 import net.runelite.client.plugins.microbot.util.bank.enums.BankLocation;
@@ -20,6 +24,7 @@ import net.runelite.client.plugins.microbot.util.math.Rs2Random;
 import net.runelite.client.plugins.microbot.util.player.Rs2Player;
 import net.runelite.client.plugins.microbot.util.walker.Rs2Walker;
 
+import javax.swing.SwingUtilities;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -27,6 +32,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.Collectors;
 
 /**
  * Scans nearby tiles for the longest clear east-to-west stretch and burns the whole thing in one
@@ -51,10 +57,17 @@ public class BaropasGeFiremakerScript extends StateMachineScript<BaropasGeFirema
     private static final int ROW_SCAN_RADIUS = 8;
     private static final int COL_SCAN_RADIUS = 15;
     private static final int MIN_LINE_LENGTH = 3;
+    // How many tiles shorter than the single longest row still counts as "good enough" to be a
+    // candidate for random selection, so line choice actually varies instead of collapsing to
+    // whichever row happens to be uniquely longest.
+    private static final int LINE_LENGTH_TOLERANCE = 4;
     // OSRS blocks firemaking within a couple of tiles of a bank booth. Observed failures were at
     // distance 2 from the booth, so exclude that ring from the scan up front instead of relying
     // solely on learning it the hard way (via noFireZones) each session.
     private static final int BANK_EXCLUSION_RADIUS = 3;
+    // How often to re-check the bank while stopped for missing supplies - frequent enough to
+    // resume soon after a restock, infrequent enough not to spam bank visits while genuinely empty.
+    private static final int STOPPED_RETRY_INTERVAL_SECONDS = 20;
 
     private BaropasGeFiremakerConfig config;
     private boolean readyToStart;
@@ -66,6 +79,9 @@ public class BaropasGeFiremakerScript extends StateMachineScript<BaropasGeFirema
     private int lineIndex;
     @Getter
     private WorldPoint currentTarget;
+    // Sticky row choice: reused across replans while it still yields a usable line, since a real
+    // player keeps working the same spot rather than hunting for somewhere new every trip.
+    private Integer preferredRowY;
     @Getter
     private int walkFailures;
     @Getter
@@ -76,6 +92,11 @@ public class BaropasGeFiremakerScript extends StateMachineScript<BaropasGeFirema
     private boolean restockSucceeded;
     @Getter
     private String lastRestockResult = "n/a";
+    private Instant stoppedRetryAt;
+    // Set when the bank simply has none of the configured log type - unlike a missing tinderbox
+    // or a bank the character couldn't reach, more waiting won't fix this, so it's worth giving up
+    // outright instead of retrying forever.
+    private boolean logTypeUnavailable;
 
     // Chat feedback, set on the client/event thread and consumed on the script thread.
     private final AtomicBoolean cannotLightHere = new AtomicBoolean(false);
@@ -191,7 +212,7 @@ public class BaropasGeFiremakerScript extends StateMachineScript<BaropasGeFirema
                 doRestock();
                 break;
             case STOPPED:
-                Microbot.status = "Baropa's GE Firemaker: stopped (" + lastRestockResult + ")";
+                doStoppedRetry();
                 break;
         }
     }
@@ -237,6 +258,7 @@ public class BaropasGeFiremakerScript extends StateMachineScript<BaropasGeFirema
         if (cannotLightHere.getAndSet(false)) {
             log.info("[BaropasGeFiremaker] Firemaking not allowed on {}, excluding it from now on", currentTarget);
             noFireZones.add(currentTarget);
+            persistNoFireZones();
             lightAttempts = 0;
             actionDone = true;
             return;
@@ -253,12 +275,20 @@ public class BaropasGeFiremakerScript extends StateMachineScript<BaropasGeFirema
         boolean used = Rs2Inventory.combine(ItemID.TINDERBOX, logType.getItemId());
 
         boolean success = false;
+        boolean failedRoll = false;
         if (used) {
             boolean started = sleepUntil(() ->
                     Rs2Player.isAnimating() || Rs2Inventory.count(logType.getItemId()) < logsBefore, 2400);
             if (started) {
                 sleepUntil(() -> !Rs2Player.isAnimating(), 5000);
                 success = Rs2Inventory.count(logType.getItemId()) < logsBefore;
+                // Animation played but the log wasn't consumed: a genuine failed lighting roll,
+                // not a click that never registered. Firemaking's success chance scales with
+                // level vs. the log's requirement, so low-level accounts (e.g. normal logs at
+                // level 1) fail far more often than the general firemaking antiban template
+                // assumes. Pause like a player reading the "you fail to light..." message
+                // instead of retrying at human-reaction speed.
+                failedRoll = !success;
             }
         }
 
@@ -274,6 +304,8 @@ public class BaropasGeFiremakerScript extends StateMachineScript<BaropasGeFirema
             log.warn("[BaropasGeFiremaker] Giving up lighting {} after {} attempts, skipping tile", currentTarget, lightAttempts);
             lightAttempts = 0;
             actionDone = true;
+        } else if (failedRoll) {
+            sleep(Rs2Random.between(1000, 2200));
         }
         // else: stay in LIGHT_LOG, natural retry next tick
     }
@@ -287,9 +319,67 @@ public class BaropasGeFiremakerScript extends StateMachineScript<BaropasGeFirema
         boolean success = restockFromBank(config.logType());
         restockSucceeded = success;
         if (!success) {
-            Microbot.showMessage("Baropa's GE Firemaker: " + lastRestockResult + ". Stopping - fix the bank and restart the plugin.");
+            if (logTypeUnavailable) {
+                disablePlugin(lastRestockResult);
+            } else {
+                announceStop(lastRestockResult);
+            }
         }
         actionDone = true;
+    }
+
+    /**
+     * Periodically re-checks the bank while stopped, so restocking it is enough to resume - no
+     * need to restart the plugin. Gated by a cooldown since each check is a real bank visit, not
+     * a free read. Gives up outright (rather than continuing to retry) if the configured log type
+     * simply isn't stocked, since that won't resolve itself no matter how many times it checks.
+     */
+    private void doStoppedRetry() {
+        Microbot.status = "Baropa's GE Firemaker: stopped (" + lastRestockResult + ")";
+
+        if (stoppedRetryAt != null && Instant.now().isBefore(stoppedRetryAt)) {
+            return;
+        }
+        stoppedRetryAt = Instant.now().plusSeconds(STOPPED_RETRY_INTERVAL_SECONDS);
+
+        if (restockFromBank(config.logType())) {
+            log.info("[BaropasGeFiremaker] Bank restocked, resuming");
+        } else if (logTypeUnavailable) {
+            disablePlugin(lastRestockResult);
+        }
+    }
+
+    /** Posts a game-message chatbox line rather than a blocking popup, so the client stays usable. */
+    private void announceStop(String reason) {
+        String message = "Baropa's GE Firemaker: " + reason + ". Stopping - checking the bank periodically; "
+                + "no restart needed once it's restocked.";
+        Microbot.getClientThread().invoke(() ->
+                Microbot.getClient().addChatMessage(ChatMessageType.GAMEMESSAGE, "", message, ""));
+    }
+
+    /**
+     * Posts a game-message and fully disables the plugin, rather than leaving it checking the bank
+     * forever for a log type it will never stock on its own.
+     */
+    private void disablePlugin(String reason) {
+        String message = "Baropa's GE Firemaker: " + reason + ". Disabling - restock the bank with "
+                + config.logType().getLogName() + " and re-enable to continue.";
+        Microbot.getClientThread().invoke(() ->
+                Microbot.getClient().addChatMessage(ChatMessageType.GAMEMESSAGE, "", message, ""));
+
+        Plugin plugin = Microbot.getPlugin(BaropasGeFiremakerPlugin.class.getName());
+        PluginManager pluginManager = Microbot.getPluginManager();
+        if (plugin == null || pluginManager == null) {
+            return;
+        }
+        SwingUtilities.invokeLater(() -> {
+            try {
+                pluginManager.setPluginEnabled(plugin, false);
+                pluginManager.stopPlugin(plugin);
+            } catch (PluginInstantiationException e) {
+                log.error("[BaropasGeFiremaker] Failed to disable plugin", e);
+            }
+        });
     }
 
     /**
@@ -299,6 +389,7 @@ public class BaropasGeFiremakerScript extends StateMachineScript<BaropasGeFirema
      * noted and go unrecognised as usable logs.
      */
     private boolean restockFromBank(LogType logType) {
+        logTypeUnavailable = false;
         boolean needTinderbox = missingTinderbox();
         boolean needLogs = outOfLogs();
 
@@ -319,11 +410,10 @@ public class BaropasGeFiremakerScript extends StateMachineScript<BaropasGeFirema
             }
         }
 
-        if (needLogs) {
-            if (Rs2Bank.hasBankItem(logType.getItemId(), 1)) {
-                Rs2Bank.withdrawX(logType.getItemId(), config.restockAmount());
-                sleepUntil(() -> Rs2Inventory.hasItem(logType.getItemId()), 3000);
-            }
+        boolean bankHasLogs = Rs2Bank.hasBankItem(logType.getItemId(), 1);
+        if (needLogs && bankHasLogs) {
+            Rs2Bank.withdrawX(logType.getItemId(), config.restockAmount());
+            sleepUntil(() -> Rs2Inventory.hasItem(logType.getItemId()), 3000);
         }
 
         Rs2Bank.closeBank();
@@ -339,6 +429,7 @@ public class BaropasGeFiremakerScript extends StateMachineScript<BaropasGeFirema
             lastRestockResult = "No tinderbox in inventory or bank";
         } else {
             lastRestockResult = "No " + logType.getLogName() + " in the bank";
+            logTypeUnavailable = !bankHasLogs;
         }
         return false;
     }
@@ -369,47 +460,74 @@ public class BaropasGeFiremakerScript extends StateMachineScript<BaropasGeFirema
     // --- Line planning ---
 
     /**
-     * Scans a window of nearby rows around the Grand Exchange bank booth for the longest contiguous run
+     * Scans a window of rows around the Grand Exchange bank booth for the longest contiguous run
      * of walkable, fire-free tiles and commits to it as one straight line, east to west - the way
      * a real player eyeballs the courtyard for open space rather than working off a fixed grid.
      * Anchored to the booth (not the player's live position) so the search stays inside the
      * courtyard instead of drifting into unrelated walkable areas (e.g. the Clan Hall entrance).
-     * Falls back to a straight line west of the current tile if nothing clear enough is found.
+     * Sticky: a real player who finds a good line keeps using it, since the previous pass's fires
+     * have burned out by the time they've restocked and walked back. Only re-scans for a new row
+     * when the preferred one can no longer produce a line that's still close to full length -
+     * accepting any old scrap of a still-valid row would mean immediately re-splitting a row into
+     * smaller and smaller pieces between its own not-yet-expired fires, never giving it a proper
+     * rest before coming back. Falls back to a straight line west of the bank if nothing clear
+     * enough is found anywhere.
      */
     private void planNewLine() {
         WorldPoint origin = BankLocation.GRAND_EXCHANGE.getWorldPoint();
         int maxLen = config.lineLength();
+        int stickyThreshold = Math.max(MIN_LINE_LENGTH, maxLen - LINE_LENGTH_TOLERANCE);
 
-        // Collect every row tied for the longest run, not just the first one found, so a capped
-        // line (very likely once maxLen is reached) doesn't always resolve to the same row -
-        // a real player wouldn't always plant themselves on the exact same tiles either.
-        List<List<WorldPoint>> tiedForBest = new ArrayList<>();
+        if (preferredRowY != null) {
+            List<WorldPoint> run = longestRunOnRow(origin, preferredRowY, maxLen);
+            if (run != null && run.size() >= stickyThreshold) {
+                adoptLine(run, preferredRowY);
+                return;
+            }
+        }
+
+        List<List<WorldPoint>> candidates = new ArrayList<>();
+        List<Integer> candidateRows = new ArrayList<>();
         int bestLength = 0;
 
         for (int dy = -ROW_SCAN_RADIUS; dy <= ROW_SCAN_RADIUS; dy++) {
-            List<WorldPoint> run = longestRunOnRow(origin, origin.getY() + dy, maxLen);
+            int y = origin.getY() + dy;
+            List<WorldPoint> run = longestRunOnRow(origin, y, maxLen);
             if (run == null) continue;
-            if (run.size() > bestLength) {
-                bestLength = run.size();
-                tiedForBest.clear();
-                tiedForBest.add(run);
-            } else if (run.size() == bestLength) {
-                tiedForBest.add(run);
-            }
+            candidates.add(run);
+            candidateRows.add(y);
+            bestLength = Math.max(bestLength, run.size());
         }
 
-        List<WorldPoint> best;
-        if (tiedForBest.isEmpty() || bestLength < MIN_LINE_LENGTH) {
-            best = new ArrayList<>();
+        if (candidates.isEmpty() || bestLength < MIN_LINE_LENGTH) {
+            List<WorldPoint> fallback = new ArrayList<>();
             for (int i = 0; i < maxLen; i++) {
-                best.add(new WorldPoint(origin.getX() - i, origin.getY(), origin.getPlane()));
+                fallback.add(new WorldPoint(origin.getX() - i, origin.getY(), origin.getPlane()));
             }
             log.warn("[BaropasGeFiremaker] No clear line found near {}, falling back to a straight line west", origin);
-        } else {
-            best = tiedForBest.get(Rs2Random.betweenInclusive(0, tiedForBest.size() - 1));
+            adoptLine(fallback, origin.getY());
+            return;
         }
 
-        currentLine = best;
+        // Pick the genuinely best line, like a player scanning for the most fires-per-trip would -
+        // only spread across rows that are truly as good as the best (a tiny tolerance for
+        // essentially-tied rows), never settle for a noticeably shorter one just for variety's
+        // sake. That previously let it pick an 8-tile row when a 4-tiles-further row had a full
+        // line available.
+        int threshold = Math.max(MIN_LINE_LENGTH, bestLength - LINE_LENGTH_TOLERANCE);
+        List<Integer> nearBestIndices = new ArrayList<>();
+        for (int i = 0; i < candidates.size(); i++) {
+            if (candidates.get(i).size() >= threshold) {
+                nearBestIndices.add(i);
+            }
+        }
+        int chosen = nearBestIndices.get(Rs2Random.betweenInclusive(0, nearBestIndices.size() - 1));
+        adoptLine(candidates.get(chosen), candidateRows.get(chosen));
+    }
+
+    private void adoptLine(List<WorldPoint> line, int rowY) {
+        currentLine = line;
+        preferredRowY = rowY;
         lineIndex = 0;
         currentTarget = currentLine.get(0);
         log.info("[BaropasGeFiremaker] Planned a {}-tile line from {} to {}",
@@ -418,7 +536,8 @@ public class BaropasGeFiremakerScript extends StateMachineScript<BaropasGeFirema
 
     /**
      * Finds the longest contiguous run of walkable, fire-free tiles on the given row, scanning
-     * from the east edge of the search window inward. Returns null if nothing usable exists.
+     * from the east edge of the search window inward and stopping once it has enough tiles for a
+     * full line. Returns null if nothing usable exists.
      */
     private List<WorldPoint> longestRunOnRow(WorldPoint origin, int y, int maxLen) {
         int plane = origin.getPlane();
@@ -465,12 +584,50 @@ public class BaropasGeFiremakerScript extends StateMachineScript<BaropasGeFirema
                 .first() != null;
     }
 
+    // --- No-fire zone persistence ---
+    //
+    // Tiles the game has rejected firemaking on (e.g. right by the Clan Hall entrance) are learned
+    // from the "can't light a fire here" chat message, not hardcoded - GE's fire-restricted tiles
+    // aren't precisely documented anywhere reliable, so guessing coordinates risks excluding tiles
+    // that are actually fine (wasting good line length) or missing ones that aren't. Persisting
+    // what's actually been observed means every session gets smarter than the last, and a tile is
+    // never re-attempted once it's known to fail.
+
+    private static final String NO_FIRE_ZONES_CONFIG_KEY = "noFireZones";
+
+    private void loadPersistedNoFireZones() {
+        noFireZones.clear();
+        String stored = Microbot.getConfigManager() == null ? null
+                : Microbot.getConfigManager().getConfiguration(BaropasGeFiremakerConfig.configGroup, NO_FIRE_ZONES_CONFIG_KEY);
+        if (stored == null || stored.isEmpty()) return;
+
+        for (String entry : stored.split(";")) {
+            String[] parts = entry.split(",");
+            if (parts.length != 3) continue;
+            try {
+                noFireZones.add(new WorldPoint(
+                        Integer.parseInt(parts[0]), Integer.parseInt(parts[1]), Integer.parseInt(parts[2])));
+            } catch (NumberFormatException ignored) {
+                // Corrupt entry - skip it rather than losing the rest of the learned set.
+            }
+        }
+    }
+
+    private void persistNoFireZones() {
+        if (Microbot.getConfigManager() == null) return;
+        String encoded = noFireZones.stream()
+                .map(p -> p.getX() + "," + p.getY() + "," + p.getPlane())
+                .collect(Collectors.joining(";"));
+        Microbot.getConfigManager().setConfiguration(BaropasGeFiremakerConfig.configGroup, NO_FIRE_ZONES_CONFIG_KEY, encoded);
+    }
+
     // --- Lifecycle ---
 
     public boolean run(BaropasGeFiremakerConfig config) {
         this.config = config;
         this.readyToStart = false;
         this.currentLine = null;
+        this.preferredRowY = null;
         this.lineIndex = 0;
         this.currentTarget = null;
         this.walkFailures = 0;
@@ -478,13 +635,32 @@ public class BaropasGeFiremakerScript extends StateMachineScript<BaropasGeFirema
         this.firesLit = 0;
         this.logsBurned = 0;
         this.lastRestockResult = "n/a";
+        this.stoppedRetryAt = null;
+        this.logTypeUnavailable = false;
         this.startXp = -1;
         this.startedAt = null;
-        this.noFireZones.clear();
+        loadPersistedNoFireZones();
+
+        // Matches the reference GEFiremakerScript's convention: this plugin walks itself
+        // deliberately (short repeated hops along the line), so the framework's own run-toggling
+        // would just fight with it. Restored on shutdown() since it's a process-global default.
+        Microbot.enableAutoRunOn = false;
 
         if (config.useAntiban()) {
+            // Reset first: a previous plugin's leftover antiban tuning (activity, play style,
+            // cooldown chances) is otherwise inherited since Rs2AntibanSettings is process-global.
+            Rs2Antiban.resetAntibanSettings();
             Rs2Antiban.antibanSetupTemplates.applyFiremakingSetup();
             Rs2Antiban.setActivity(Activity.GENERAL_FIREMAKING);
+            // The template defaults these to false (a fixed profile) - the reference
+            // GEFiremakerScript turns both on for more natural variation over a long session, and
+            // there's no hang risk here (unlike micro-breaks below).
+            Rs2AntibanSettings.dynamicActivity = true;
+            Rs2AntibanSettings.dynamicIntensity = true;
+            // Deliberately leave takeMicroBreaks at the template's default (false): triggering a
+            // micro-break sets Rs2AntibanSettings.microBreakActive, which only the separate Break
+            // Handler plugin resolves. Without it enabled, the flag never clears and the script
+            // hangs indefinitely - confirmed live. actionCooldown() alone is self-contained.
             Rs2Antiban.activateAntiban();
         }
 
@@ -517,7 +693,9 @@ public class BaropasGeFiremakerScript extends StateMachineScript<BaropasGeFirema
     public void shutdown() {
         if (config != null && config.useAntiban()) {
             Rs2Antiban.deactivateAntiban();
+            Rs2Antiban.resetAntibanSettings();
         }
+        Microbot.enableAutoRunOn = true;
         super.shutdown();
     }
 

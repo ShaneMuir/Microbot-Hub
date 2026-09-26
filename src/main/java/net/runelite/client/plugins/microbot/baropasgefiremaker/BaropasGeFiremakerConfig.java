@@ -57,7 +57,8 @@ public interface BaropasGeFiremakerConfig extends Config {
             name = "Max line length",
             description = "Upper limit on fires per line. The script scans nearby tiles and burns the "
                     + "longest clear east-to-west stretch it can find, up to this many fires. Defaults to "
-                    + "a full inventory (27 logs, since the tinderbox takes the 28th slot).",
+                    + "a full inventory (27 logs, since the tinderbox takes the 28th slot) - a real player "
+                    + "maximises fires per trip rather than leaving logs unburned.",
             position = 1,
             section = firemakingSection
     )

@@ -1,5 +1,6 @@
 package net.runelite.client.plugins.microbot.baropasgefiremaker;
 
+import net.runelite.client.plugins.microbot.util.antiban.Rs2Antiban;
 import net.runelite.client.ui.overlay.OverlayLayer;
 import net.runelite.client.ui.overlay.OverlayPanel;
 import net.runelite.client.ui.overlay.OverlayPosition;
@@ -16,9 +17,13 @@ public class BaropasGeFiremakerOverlay extends OverlayPanel {
     private final BaropasGeFiremakerConfig config;
 
     @Inject
-    BaropasGeFiremakerOverlay(BaropasGeFiremakerPlugin plugin, BaropasGeFiremakerScript script, BaropasGeFiremakerConfig config) {
+    BaropasGeFiremakerOverlay(BaropasGeFiremakerPlugin plugin, BaropasGeFiremakerConfig config) {
         super(plugin);
-        this.script = script;
+        // Read stats through the plugin's own script instance rather than injecting
+        // BaropasGeFiremakerScript separately - without an explicit singleton binding, a
+        // second injection point is not guaranteed to resolve to the same object as the one
+        // the plugin actually calls run() on, which silently freezes every stat at zero.
+        this.script = plugin.script;
         this.config = config;
         setPosition(OverlayPosition.TOP_LEFT);
         setPreferredSize(new Dimension(ComponentConstants.STANDARD_WIDTH, 160));
@@ -58,6 +63,10 @@ public class BaropasGeFiremakerOverlay extends OverlayPanel {
                     .left("Runtime:")
                     .right(formatDuration(runtimeSeconds))
                     .build());
+
+            if (config.useAntiban()) {
+                Rs2Antiban.renderAntibanOverlayComponents(panelComponent);
+            }
 
             if (config.showDebugOverlay()) {
                 addDebugLines();
