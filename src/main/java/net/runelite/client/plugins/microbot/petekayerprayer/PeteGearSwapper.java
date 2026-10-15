@@ -61,6 +61,8 @@ final class PeteGearSwapper {
     private static final Set<Integer> FREEZE_SPOTANIMS = Set.of(179, 180, 181, 361, 363, 366, 369);
     // The halberd reaches 2 tiles.
     private static final int MELEE_REACH = 2;
+    /** Between swaps while Pete is on the player's tile, about one attack cycle. */
+    private static final long STANDBY_SWAP_COOLDOWN_MS = 3000;
     // A freeze runs about 29 ticks from the message to the thaw warning, and a little past it.
     private static final int MAX_FREEZE_TICKS = 40;
     private static final int THAW_TICKS = 3;
@@ -75,6 +77,7 @@ final class PeteGearSwapper {
 
     private final Client client;
     private long lastSwapMs;
+    private long lastStandbySwapMs;
     private long lastPrayerMs;
     private long specSinceMs;
 
@@ -217,6 +220,12 @@ final class PeteGearSwapper {
         PeteSwapPlanner.Style current = currentStyle(equipment, melee, ranged, magic);
         PeteSwapPlanner.Style effective = current;
 
+        // Pete on the player's tile: the cycle below needs attacks to time from and there are none.
+        if (castBlocked(pete)) {
+            standbyOnTop(config, pete, current, melee, ranged, magic, equipment, inventory, now);
+            return;
+        }
+
         // Everything runs off the player's own attack cadence. With no attack for a while (the fight is
         // over, or the player has stopped) there is nothing to time, so do nothing rather than react.
         boolean timed = lastAttackTick > 0 && tick - lastAttackTick <= CADENCE_STALE_TICKS;
@@ -273,7 +282,8 @@ final class PeteGearSwapper {
         // Act once per attack cycle, on the tick before the attack is due.
         if (!cycleActed && nextAttackTick - tick <= 1) {
             cycleActed = true;
-            if (specReady(config, pete, equipment, inventory)) {
+            int head = protectedIcon(pete);
+            if (specReady(config, pete, head, equipment, inventory)) {
                 startSpec(config, equipment, inventory, now);
                 effective = PeteSwapPlanner.Style.MELEE;
             } else {
@@ -282,7 +292,6 @@ final class PeteGearSwapper {
                 // already in hand counts: after a swing the tank set puts the crossbow back in hand, so a
                 // ranged attack costs no swap at all.
                 boolean meleeReachable = meleeReachable(pete);
-                int head = protectedIcon(pete);
                 PeteSwapPlanner.Style target = PeteSwapPlanner.choose(null, head,
                         PeteSwapPlanner.parseOrder(config.swapOrder()),
                         style -> style != PeteSwapPlanner.Style.MAGIC
@@ -383,6 +392,7 @@ final class PeteGearSwapper {
         cycleActed = false;
         specSinceMs = 0;
         lastSwapMs = 0;
+        lastStandbySwapMs = 0;
         lastFreezeCastTick = 0;
         frozenEndTick = 0;
         wasFrozen = false;
@@ -493,11 +503,17 @@ final class PeteGearSwapper {
 
     /**
      * Whether to use the Voidwaker special on this attack: the assist is on, there is enough energy, the
-     * weapon is to hand, and Pete is next to the player (he can't be hit from his own tile, or from range).
+     * weapon is to hand, Pete isn't praying Magic (the special's damage is magic, so his prayer blocks it), and
+     * he is in melee reach right now: beside the player on a side, not diagonal, not on top of them, not out of
+     * reach of a frozen player.
      */
-    private boolean specReady(PeteKayerPrayerConfig config, NPC pete, ItemContainer equipment, ItemContainer inventory) {
+    private boolean specReady(PeteKayerPrayerConfig config, NPC pete, int head, ItemContainer equipment, ItemContainer inventory) {
         String spec = config.specWeapon() == null ? "" : config.specWeapon().trim();
         if (!config.specAssist() || spec.isEmpty()) {
+            return false;
+        }
+        if (head == PeteSwapPlanner.Style.MAGIC.getIcon()) {
+            log.debug("[PeteKayerPrayer] no special: Pete is praying Magic");
             return false;
         }
         if (client.getVarpValue(VarPlayer.SPECIAL_ATTACK_PERCENT) < config.specEnergyPercent() * 10) {
@@ -507,7 +523,35 @@ final class PeteGearSwapper {
             return false;
         }
         net.runelite.api.Player me = client.getLocalPlayer();
-        return me != null && pete.getWorldLocation().distanceTo(me.getWorldLocation()) == 1;
+        return me != null && pete.getWorldArea().isInMeleeDistance(me.getWorldArea());
+    }
+
+    /**
+     * Pete is on the player's tile (he death-dots there between attacks): nothing can be attacked, so there are no
+     * attack animations to time a cycle from. Keep the weapon in hand off whatever he is praying anyway, one swap
+     * per few ticks, so the first hit after he steps off isn't onto his prayer.
+     */
+    private void standbyOnTop(PeteKayerPrayerConfig config, NPC pete, PeteSwapPlanner.Style current, List<String> melee,
+                              List<String> ranged, List<String> magic, ItemContainer equipment, ItemContainer inventory, long now) {
+        if (restPending) {
+            restPending = false;
+            if (config.tankBetweenSwings() && !equipSet(ranged, equipment, inventory).isEmpty()) {
+                return; // the tank set is going on; the equipment isn't updated until next tick
+            }
+        }
+        int head = protectedIcon(pete);
+        PeteSwapPlanner.Style target = PeteSwapPlanner.choose(current, head, PeteSwapPlanner.parseOrder(config.swapOrder()),
+                style -> style != PeteSwapPlanner.Style.MAGIC && styleAvailable(gear(style, melee, ranged, magic), equipment, inventory),
+                now, lastStandbySwapMs, STANDBY_SWAP_COOLDOWN_MS);
+        if (target == null) {
+            return;
+        }
+        lastStandbySwapMs = now;
+        log.debug("[PeteKayerPrayer] Pete is on top of me praying {}: {} -> {}", PeteSwapPlanner.Style.fromIcon(head), current, target);
+        if (config.swapOffensivePrayer()) {
+            ensureOffensivePrayer(target, now); // prayer first, then the gear
+        }
+        swapTo(target, current, pete, melee, ranged, magic, equipment, inventory);
     }
 
     /** Piety first, then the Voidwaker, then the special bar - all in this tick, so the next attack is the special. */
